@@ -142,6 +142,56 @@ final class PipelineTests: XCTestCase {
         try XCTAssertNil(channel.readOutbound(as: ByteBuffer.self)?.string)
     }
 
+    func testContentLengthLongerThanHeader() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.on(.POST, "echo", body: .stream) { request -> Response in
+            Response(body: .init(stream: { writer in
+                request.body.drain { body in
+                    switch body {
+                    case .buffer(let buffer):
+                        return writer.write(.buffer(buffer))
+                    case .error(let error):
+                        return writer.write(.error(error))
+                    case .end:
+                        return writer.write(.end)
+                    }
+                }
+            }))
+        }
+
+        let channel = EmbeddedChannel()
+        try channel.connect(to: .init(unixDomainSocketPath: "/foo")).wait()
+        try channel.pipeline.addVaporHTTP1Handlers(
+            application: app,
+            responder: app.responder,
+            configuration: app.http.server.configuration
+        ).wait()
+
+        XCTAssertEqual(channel.isActive, true)
+
+        // Create a request where actual content length is longer than the specified header
+        let bodyContent = "This is a test body content."
+        let incorrectContentLength = 10 // bodyContent.count // deliberately incorrect, shorter than actual content
+        let requestString = "POST /echo HTTP/1.1\r\nContent-Length: \(incorrectContentLength)\r\n\r\n\(bodyContent)"
+        let request = ByteBuffer(string: requestString)
+
+        // Expect an error due to content length mismatch
+        XCTAssertThrowsError(try channel.writeInbound(request)) { error in
+            if let error = error as? HTTPParserError {
+                print(error)
+            } else {
+                XCTFail("Caught unexpected error \"\(error)\"")
+            }
+        }
+        XCTAssertEqual(channel.isActive, false)
+
+        // Verify that the server responds with a 400 Bad Request error
+        try XCTAssertContains(channel.readOutbound(as: ByteBuffer.self)?.string, "HTTP/1.1 400 Bad Request")
+        try XCTAssertNil(channel.readOutbound(as: ByteBuffer.self)?.string)
+    }
+
     override class func setUp() {
         XCTAssert(isLoggingConfigured)
     }
